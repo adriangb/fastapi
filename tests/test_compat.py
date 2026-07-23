@@ -138,3 +138,19 @@ def test_serialize_sequence_value_with_none_first_in_union():
     result = v2.serialize_sequence_value(field=field, value=["x", "y"])
     assert result == ["x", "y"]
     assert isinstance(result, list)
+
+
+def test_type_adapter_cache_skips_unhashable_components():
+    from fastapi._compat import v2
+
+    def make_field() -> v2.ModelField:
+        extra: dict[Any, Any] = {"a": 1}
+        extra[1] = "a"
+        field_info = FieldInfo(annotation=int, json_schema_extra=extra)
+        return v2.ModelField(name="foo", field_info=field_info)
+
+    field1 = make_field()
+    field2 = make_field()
+    assert field1._type_adapter is not field2._type_adapter
+    assert field1.validate("1") == (1, [])
+    assert field2.validate("1") == (1, [])
