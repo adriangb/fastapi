@@ -1,8 +1,10 @@
 import re
 import warnings
+import weakref
 from collections.abc import Sequence
 from copy import copy
 from dataclasses import dataclass, is_dataclass
+from dataclasses import fields as dataclass_fields
 from enum import Enum
 from functools import lru_cache
 from typing import (
@@ -110,6 +112,93 @@ def asdict(field_info: FieldInfo) -> dict[str, Any]:
     }
 
 
+_type_adapter_cache: "weakref.WeakValueDictionary[Any, TypeAdapter[Any]]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+class _ByIdentity:
+    # Equality proxy for objects whose `__eq__` cannot be trusted for cache
+    # correctness (arbitrary user metadata, classes with metaclass `__eq__`,
+    # pydantic-internal markers): wrappers compare equal only when they hold
+    # the very same object, so a faulty or overly-loose `__eq__` is never
+    # consulted and can never cause two semantically different fields to
+    # share an adapter.
+    __slots__ = ("obj",)
+
+    def __init__(self, obj: Any) -> None:
+        self.obj = obj
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _ByIdentity) and self.obj is other.obj
+
+    def __hash__(self) -> int:
+        return id(self.obj)
+
+
+# Exact types whose `__eq__`/`__hash__` are value-based and faithful. Tagged
+# with their class when frozen so equal-comparing values of different types
+# (True vs 1) can never collide.
+_TRUSTED_SCALAR_TYPES = (str, bytes, int, float, complex, bool, type(None))
+
+
+def _freeze(value: Any) -> Any:
+    cls = value.__class__
+    if cls is dict:
+        return (dict, tuple((_freeze(k), _freeze(v)) for k, v in sorted(value.items())))
+    if cls is list or cls is tuple:
+        return (cls, tuple(_freeze(v) for v in value))
+    if cls is set or cls is frozenset:
+        return (cls, frozenset(_freeze(v) for v in value))
+    if cls in _TRUSTED_SCALAR_TYPES:
+        return (cls, value)
+    if is_dataclass(value) and cls.__module__ == "annotated_types":
+        # Constraint markers (Gt, Le, MaxLen, ...) are plain frozen dataclasses;
+        # freeze them structurally so fresh-but-equal constraints still share.
+        return (
+            cls,
+            tuple(_freeze(getattr(value, f.name)) for f in dataclass_fields(value)),
+        )
+    return _ByIdentity(value)
+
+
+def _freeze_annotation(annotation: Any) -> Any:
+    # Python's equality on type expressions is coarser than pydantic's
+    # semantics: `int | str == str | int` is True, but validation of a union
+    # is order-sensitive (e.g. `union_mode="left_to_right"`). Recursing with
+    # `get_origin`/`get_args` preserves argument order, so differently-ordered
+    # unions (and any other structurally different expressions) get different
+    # keys. Leaves fall through to `_freeze`, i.e. identity for classes.
+    origin = get_origin(annotation)
+    if origin is None:
+        return _freeze(annotation)
+    frozen_args = tuple(
+        (list, tuple(_freeze_annotation(p) for p in arg))
+        if isinstance(arg, list)  # e.g. the parameter list of Callable[[X], Y]
+        else _freeze_annotation(arg)
+        for arg in get_args(annotation)
+    )
+    return (_freeze(origin), frozen_args)
+
+
+def _type_adapter_cache_key(
+    field_dict: dict[str, Any], config: ConfigDict | None
+) -> Any:
+    # None means "don't cache": the key could not be built, so sharing can't
+    # be proven safe and a fresh adapter is built instead.
+    try:
+        key = (
+            _freeze_annotation(field_dict["annotation"]),
+            _freeze(field_dict["metadata"]),
+            _freeze(field_dict["attributes"]),
+            _freeze(config),
+        )
+        hash(key)
+    except (TypeError, RecursionError):
+        return None
+    return key
+
+
 @dataclass
 class ModelField:
     field_info: FieldInfo
@@ -153,17 +242,30 @@ class ModelField:
             # TODO: remove after setting the min Pydantic to v2.12.3
             # that adds asdict(), and use self.field_info.asdict() instead
             field_dict = asdict(self.field_info)
-            annotated_args = (
-                field_dict["annotation"],
-                *field_dict["metadata"],
-                # this FieldInfo needs to be created again so that it doesn't include
-                # the old field info metadata and only the rest of the attributes
-                Field(**field_dict["attributes"]),
+            # The adapter is fully determined by (annotation, metadata,
+            # attributes, config) and is immutable once built, so identical
+            # combinations share one adapter (and its pydantic-core validator
+            # and serializer) instead of building a fresh one per parameter
+            # per route.
+            cache_key = _type_adapter_cache_key(field_dict, self.config)
+            adapter = (
+                _type_adapter_cache.get(cache_key) if cache_key is not None else None
             )
-            self._type_adapter: TypeAdapter[Any] = TypeAdapter(
-                Annotated[annotated_args],  # ty: ignore[invalid-type-form]
-                config=self.config,
-            )
+            if adapter is None:
+                annotated_args = (
+                    field_dict["annotation"],
+                    *field_dict["metadata"],
+                    # this FieldInfo needs to be created again so that it doesn't include
+                    # the old field info metadata and only the rest of the attributes
+                    Field(**field_dict["attributes"]),
+                )
+                adapter = TypeAdapter(
+                    Annotated[annotated_args],  # ty: ignore[invalid-type-form]
+                    config=self.config,
+                )
+                if cache_key is not None:
+                    _type_adapter_cache[cache_key] = adapter
+            self._type_adapter: TypeAdapter[Any] = adapter
 
     def get_default(self) -> Any:
         if self.field_info.is_required():
