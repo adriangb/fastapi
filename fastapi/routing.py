@@ -800,7 +800,7 @@ class APIWebSocketRoute(routing.WebSocketRoute):
         self.path_regex, self.path_format, self.param_convertors = compile_path(path)
         (
             self.dependant,
-            self._flat_dependant,
+            _,
             self._embed_body_fields,
         ) = _build_dependant_with_parameterless_dependencies(
             path=self.path_format,
@@ -937,7 +937,6 @@ class _APIRouteLike(Protocol):
     description: str
     response_fields: dict[int | str, ModelField]
     dependant: Dependant
-    _flat_dependant: Dependant
     _embed_body_fields: bool
     body_field: ModelField | None
     is_sse_stream: bool
@@ -1084,7 +1083,7 @@ def _populate_api_route_state(
     assert callable(endpoint), "An endpoint must be a callable"
     (
         route.dependant,
-        route._flat_dependant,
+        flat_dependant,
         route._embed_body_fields,
     ) = _build_dependant_with_parameterless_dependencies(
         path=route.path_format,
@@ -1092,7 +1091,7 @@ def _populate_api_route_state(
         dependencies=route.dependencies,
     )
     route.body_field = get_body_field(
-        flat_dependant=route._flat_dependant,
+        flat_dependant=flat_dependant,
         name=route.unique_id,
         embed_body_fields=route._embed_body_fields,
     )
@@ -1138,7 +1137,6 @@ class APIRoute(routing.Route):
     description: str
     response_fields: dict[int | str, ModelField]
     dependant: Dependant
-    _flat_dependant: Dependant
     _embed_body_fields: bool
     body_field: ModelField | None
     is_sse_stream: bool
@@ -1403,7 +1401,6 @@ class _EffectiveRouteContext:
     description: str = ""
     response_fields: dict[int | str, ModelField] = field(default_factory=dict)
     dependant: Dependant | None = None
-    _flat_dependant: Dependant | None = None
     _embed_body_fields: bool = False
     body_field: ModelField | None = None
     is_sse_stream: bool = False
@@ -1479,7 +1476,7 @@ class _EffectiveRouteContext:
         )
         (
             context.dependant,
-            context._flat_dependant,
+            _,
             context._embed_body_fields,
         ) = _build_dependant_with_parameterless_dependencies(
             path="",
@@ -2073,7 +2070,7 @@ class _FrontendRouteGroup(BaseRoute):
         self.dependency_overrides_provider = dependency_overrides_provider
         (
             self.dependant,
-            self._flat_dependant,
+            _,
             self._embed_body_fields,
         ) = _build_dependant_with_parameterless_dependencies(
             path="",
