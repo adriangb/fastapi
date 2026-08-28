@@ -55,7 +55,7 @@ ROUTER = build_router()
 
 
 def normalize(value: Any) -> str:
-    return re.sub(r"0x[0-9a-f]{6,}", "0xADDR", repr(value))
+    return re.sub(r"0x[0-9a-fA-F]{6,}", "0xADDR", repr(value))
 
 
 def contexts_for(**include_kwargs: Any) -> list[_EffectiveRouteContext]:
