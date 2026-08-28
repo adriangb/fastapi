@@ -56,6 +56,7 @@ from fastapi.concurrency import (
 )
 from fastapi.dependencies.models import (
     Dependant,
+    _CallIdentity,
     _get_cache_key,
     _get_computed_scope,
     _get_oauth_scopes,
@@ -136,11 +137,14 @@ def get_parameterless_sub_dependant(*, depends: params.Depends, path: str) -> De
     own_oauth_scopes: list[str] = []
     if isinstance(depends, params.Security) and depends.scopes:
         own_oauth_scopes.extend(depends.scopes)
-    return get_dependant(
+    return _get_sub_dependant_cached(
         path=path,
         call=depends.dependency,
-        scope=depends.scope,
+        name=None,
         own_oauth_scopes=own_oauth_scopes,
+        parent_oauth_scopes=[],
+        use_cache=True,
+        scope=depends.scope,
     )
 
 
@@ -289,16 +293,7 @@ def get_dependant(
     )
     current_scopes = (parent_oauth_scopes or []) + (own_oauth_scopes or [])
     path_param_names = get_path_param_names(path)
-    endpoint_signature = get_typed_signature(call)
-    signature_params = endpoint_signature.parameters
-    for param_name, param in signature_params.items():
-        is_path_param = param_name in path_param_names
-        param_details = analyze_param(
-            param_name=param_name,
-            annotation=param.annotation,
-            value=param.default,
-            is_path_param=is_path_param,
-        )
+    for param_name, param_details in _get_analyzed_params(call, path_param_names):
         if param_details.depends is not None:
             assert param_details.depends.dependency
             if (
@@ -319,7 +314,7 @@ def get_dependant(
             if isinstance(param_details.depends, params.Security):
                 if param_details.depends.scopes:
                     sub_own_oauth_scopes = list(param_details.depends.scopes)
-            sub_dependant = get_dependant(
+            sub_dependant = _get_sub_dependant_cached(
                 path=path,
                 call=param_details.depends.dependency,
                 name=param_name,
@@ -376,6 +371,95 @@ class ParamDetails:
     type_annotation: Any
     depends: params.Depends | None
     field: ModelField | None
+
+
+_AnalyzedParams = list[tuple[str, ParamDetails]]
+_analyzed_params_cache: dict[
+    tuple[_CallIdentity, tuple[str, ...]], _AnalyzedParams
+] = {}
+_typed_signature_cache: dict[_CallIdentity, inspect.Signature] = {}
+_SubDependantCacheKey = tuple[
+    _CallIdentity,
+    str | None,
+    tuple[str, ...],
+    tuple[str, ...],
+    bool,
+    Literal["function", "request"] | None,
+    frozenset[str],
+]
+_sub_dependant_cache: dict[_SubDependantCacheKey, Dependant] = {}
+
+
+def _get_sub_dependant_cached(
+    *,
+    path: str,
+    call: Callable[..., Any],
+    name: str | None,
+    own_oauth_scopes: list[str],
+    parent_oauth_scopes: list[str],
+    use_cache: bool,
+    scope: Literal["function", "request"] | None,
+) -> Dependant:
+    # Keyed on the full path-param set, not the consumed intersection: the cached
+    # node stores the first builder's `path`, which solve_dependencies reuses to
+    # rebuild overridden dependants whose signatures may name any path param.
+    cache_key: _SubDependantCacheKey = (
+        _CallIdentity(call),
+        name,
+        tuple(own_oauth_scopes),
+        tuple(parent_oauth_scopes),
+        use_cache,
+        scope,
+        frozenset(get_path_param_names(path)),
+    )
+    sub_dependant = _sub_dependant_cache.get(cache_key)
+    if sub_dependant is None:
+        sub_dependant = get_dependant(
+            path=path,
+            call=call,
+            name=name,
+            own_oauth_scopes=own_oauth_scopes,
+            parent_oauth_scopes=parent_oauth_scopes,
+            use_cache=use_cache,
+            scope=scope,
+        )
+        _sub_dependant_cache[cache_key] = sub_dependant
+    return sub_dependant
+
+
+def _get_cached_typed_signature(call: Callable[..., Any]) -> inspect.Signature:
+    key = _CallIdentity(call)
+    signature = _typed_signature_cache.get(key)
+    if signature is None:
+        signature = get_typed_signature(call)
+        _typed_signature_cache[key] = signature
+    return signature
+
+
+def _get_analyzed_params(
+    call: Callable[..., Any], path_param_names: set[str]
+) -> _AnalyzedParams:
+    signature_params = _get_cached_typed_signature(call).parameters
+    cache_key = (
+        _CallIdentity(call),
+        tuple(sorted(path_param_names & signature_params.keys())),
+    )
+    analyzed_params = _analyzed_params_cache.get(cache_key)
+    if analyzed_params is None:
+        analyzed_params = [
+            (
+                param_name,
+                analyze_param(
+                    param_name=param_name,
+                    annotation=param.annotation,
+                    value=param.default,
+                    is_path_param=param_name in path_param_names,
+                ),
+            )
+            for param_name, param in signature_params.items()
+        ]
+        _analyzed_params_cache[cache_key] = analyzed_params
+    return analyzed_params
 
 
 def analyze_param(
