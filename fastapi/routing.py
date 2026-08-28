@@ -1370,6 +1370,27 @@ class _RouterIncludeContext:
         return self.prefix + route.path
 
 
+def _can_copy_route_state(
+    *,
+    route: "_APIRouteLike",
+    include_context: "_RouterIncludeContext",
+    effective_response_class: type[Response] | DefaultPlaceholder,
+    effective_generate_unique_id: Callable[..., str] | DefaultPlaceholder,
+) -> bool:
+    # The fast path only fires for prefix-less includes: `include_router(r)`
+    # with no prefix, dependencies, or responses, and an unchanged effective
+    # response class and unique-id function. `APIRouter(prefix=...)` at
+    # construction still qualifies (folded into route.path), but the idiomatic
+    # `include_router(r, prefix="/items")` always takes the full rebuild.
+    return (
+        not include_context.prefix
+        and not include_context.dependencies
+        and not include_context.responses
+        and effective_response_class == route.response_class
+        and effective_generate_unique_id == route.generate_unique_id_function
+    )
+
+
 @dataclass
 class _EffectiveRouteContext:
     original_route: BaseRoute
@@ -1422,6 +1443,41 @@ class _EffectiveRouteContext:
     is_sse_stream: bool = False
     is_json_stream: bool = False
 
+    _COPIED_ROUTE_STATE_FIELDS = (
+        "path",
+        "endpoint",
+        "stream_item_type",
+        "response_model",
+        "summary",
+        "response_description",
+        "operation_id",
+        "response_model_include",
+        "response_model_exclude",
+        "response_model_by_alias",
+        "response_model_exclude_unset",
+        "response_model_exclude_defaults",
+        "response_model_exclude_none",
+        "response_class",
+        "openapi_extra",
+        "generate_unique_id_function",
+        "name",
+        "path_regex",
+        "path_format",
+        "param_convertors",
+        "methods",
+        "unique_id",
+        "status_code",
+        "response_field",
+        "stream_item_field",
+        "description",
+        "response_fields",
+        "dependant",
+        "_embed_body_fields",
+        "body_field",
+        "is_sse_stream",
+        "is_json_stream",
+    )
+
     @classmethod
     def from_api_route(
         cls,
@@ -1431,6 +1487,50 @@ class _EffectiveRouteContext:
     ) -> "_EffectiveRouteContext":
         route = cast(_APIRouteLike, original_route)
         context = cls(original_route=original_route)
+        effective_response_class = get_value_or_default(
+            route.response_class,
+            include_context.included_router.default_response_class,
+            include_context.default_response_class,
+        )
+        effective_generate_unique_id = get_value_or_default(
+            route.generate_unique_id_function,
+            include_context.included_router.generate_unique_id_function,
+            include_context.generate_unique_id_function,
+        )
+        if _can_copy_route_state(
+            route=route,
+            include_context=include_context,
+            effective_response_class=effective_response_class,
+            effective_generate_unique_id=effective_generate_unique_id,
+        ):
+            # The include context does not change any of the expensive built
+            # state (dependant tree, model fields, compiled path, unique_id),
+            # so copy it from the original route and only apply the cheap
+            # combine-only attributes.
+            # The copied fields alias the route's objects (dependant, ModelFields,
+            # regex, convertors) - they are shared, not cloned. This is safe only
+            # while nothing mutates them post-construction; anything that needs a
+            # per-context variant must go through the _populate_api_route_state
+            # rebuild below instead.
+            for field_name in cls._COPIED_ROUTE_STATE_FIELDS:
+                setattr(context, field_name, getattr(route, field_name))
+            context.tags = [*include_context.tags, *route.tags]
+            context.dependencies = list(route.dependencies)
+            context.responses = dict(route.responses)
+            context.callbacks = [*include_context.callbacks, *(route.callbacks or [])]
+            context.deprecated = route.deprecated or include_context.deprecated
+            context.include_in_schema = (
+                route.include_in_schema and include_context.include_in_schema
+            )
+            context.dependency_overrides_provider = (
+                include_context.dependency_overrides_provider
+            )
+            context.strict_content_type = get_value_or_default(
+                route.strict_content_type,
+                include_context.included_router.strict_content_type,
+                include_context.strict_content_type,
+            )
+            return context
         _populate_api_route_state(
             cast(_APIRouteLike, context),
             include_context.path_for(original_route),
@@ -1454,20 +1554,12 @@ class _EffectiveRouteContext:
             response_model_exclude_none=route.response_model_exclude_none,
             include_in_schema=route.include_in_schema
             and include_context.include_in_schema,
-            response_class=get_value_or_default(
-                route.response_class,
-                include_context.included_router.default_response_class,
-                include_context.default_response_class,
-            ),
+            response_class=effective_response_class,
             name=route.name,
             dependency_overrides_provider=include_context.dependency_overrides_provider,
             callbacks=[*include_context.callbacks, *(route.callbacks or [])],
             openapi_extra=route.openapi_extra,
-            generate_unique_id_function=get_value_or_default(
-                route.generate_unique_id_function,
-                include_context.included_router.generate_unique_id_function,
-                include_context.generate_unique_id_function,
-            ),
+            generate_unique_id_function=effective_generate_unique_id,
             strict_content_type=get_value_or_default(
                 route.strict_content_type,
                 include_context.included_router.strict_content_type,
