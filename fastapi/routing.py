@@ -1839,6 +1839,26 @@ def iter_route_contexts(
                 yield RouteContext(original_route, route_context)
 
 
+def _iter_effective_route_paths(
+    routes: Sequence[BaseRoute], prefix: str = "", nested: bool = False
+) -> Iterator[tuple[str | None, str]]:
+    for route in routes:
+        if isinstance(route, _IncludedRouter):
+            yield from _iter_effective_route_paths(
+                route.original_router.routes,
+                prefix + route.include_context.prefix,
+                nested=True,
+            )
+        elif not nested:
+            yield getattr(route, "path", None), getattr(route, "name", "unknown")
+        elif isinstance(route, routing.Mount):
+            yield (prefix + route.path).rstrip("/"), route.name or "unknown"
+        elif isinstance(route, (routing.Route, routing.WebSocketRoute)):
+            yield prefix + route.path, route.name
+        # Frontend groups live in _low_priority_routes, never in routes.
+        # Host routes and unknown route types have no effective path.
+
+
 def _iter_routes_with_context(
     routes: Sequence[BaseRoute],
 ) -> Iterator[tuple[BaseRoute, _EffectiveRouteContext | None]]:
@@ -3279,16 +3299,7 @@ class APIRouter(routing.Router):
                 "A path prefix must not end with '/', as the routes will start with '/'"
             )
         else:
-            for route, route_context in _iter_routes_with_context(router.routes):
-                if route_context is None:
-                    path = getattr(route, "path", None)
-                    name = getattr(route, "name", "unknown")
-                elif route_context.starlette_route is not None:
-                    path = getattr(route_context.starlette_route, "path", None)
-                    name = getattr(route_context.starlette_route, "name", "unknown")
-                else:
-                    path = route_context.path
-                    name = route_context.name
+            for path, name in _iter_effective_route_paths(router.routes):
                 if path is not None and not path:
                     raise FastAPIError(
                         f"Prefix and path cannot be both empty (path operation: {name})"
